@@ -1,5 +1,5 @@
-﻿using Microsoft.WindowsAzure.Storage.Blob;
-using Microsoft.WindowsAzure.Storage.Table;
+﻿using Azure.Data.Tables;
+using Azure.Storage.Blobs;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -14,22 +14,22 @@ namespace SynchronizationUtils.GlobalLock.Persistence
         /// Gets a reference to a blob container.
         /// </summary>
         /// <param name="container">A container name.</param>
-        /// <returns>A reference to a blob container.</returns>
-        Task<CloudBlobContainer> GetContainerReference(string container);
+        /// <returns>A reference to a blob container client.</returns>
+        Task<BlobContainerClient> GetContainerClient(string container);
 
         /// <summary>
-        /// Gets a reference to a storage table.
+        /// Gets a reference to a table client.
         /// </summary>
         /// <param name="table">A table name.</param>
-        /// <returns>A reference to a storage table.</returns>
-        Task<CloudTable> GetTableReference(string table);
+        /// <returns>A reference to a table client.</returns>
+        Task<TableClient> GetTableClient(string table);
 
         /// <summary>
-        /// Tries to acquire a cloud native lock associated with the given resource UID.
+        /// Attempts to acquire a lease on a blob identified by the resource UID.
         /// </summary>
-        /// <param name="resourceUID">The resource UID to lock on.</param>
-        /// <param name="token">A cancellation token.</param>
-        /// <returns>A native lock instance for the given resource UID.</returns>
+        /// <param name="resourceUID">A unique identifier for the resource to be leased.</param>
+        /// <param name="token">A cancellation token to observe while waiting for the task to complete.</param>
+        /// <returns>A <see cref="BlobLease"/> object representing the requested lease.</returns>
         Task<BlobLease> TryAcquireBlobLease(string resourceUID, CancellationToken token);
     }
 }

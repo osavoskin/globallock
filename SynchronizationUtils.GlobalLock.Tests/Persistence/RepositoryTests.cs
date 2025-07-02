@@ -1,8 +1,6 @@
-﻿using SynchronizationUtils.GlobalLock.Utils;
+﻿using Azure;
 using Microsoft.Extensions.Options;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Table;
-using Moq;
+using SynchronizationUtils.GlobalLock.Utils;
 
 namespace SynchronizationUtils.GlobalLock.Tests.Persistence
 {
@@ -18,27 +16,23 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
         private readonly GlobalLockConfiguration configuration = new();
         private readonly Repository repository;
 
-        public RepositoryTests() => repository = new Repository(
-            storageClient.Object,
-            Options.Create(configuration));
+        public RepositoryTests()
+        {
+            repository = new Repository(storageClient.Object, Options.Create(configuration));
+        }
 
         [TestInitialize]
         public void Initialize()
         {
             storageClient
-                .Setup(o => o.GetTableReference(configuration.TableName))
+                .Setup(o => o.GetTableClient(configuration.TableName))
                 .ReturnsAsync(table);
 
             // the resource is available by default
-            table.QueryFunc = () => Enumerable.Empty<Record>();
+            table.QueryFunc = () => [];
 
             // success, echo back what has been received
-            table.CommandFunc = (operation, _) => new()
-            {
-                Etag = operation.Entity.ETag,
-                Result = operation.Entity,
-                HttpStatusCode = 204
-            };
+            table.CommandFunc = (record, token) => MockResponse.NoContent;
         }
 
         [TestMethod]
@@ -66,6 +60,7 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
             // Assert
             Assert.IsNotNull(record);
             Assert.IsTrue(leaseReleased);
+            Mock.Verify(storageClient);
         }
 
         [TestMethod]
@@ -89,6 +84,7 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
 
             // Assert
             Assert.IsNull(record);
+            Mock.Verify(storageClient);
         }
 
         [TestMethod]
@@ -110,14 +106,14 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
                 tokenSource.Token);
 
             // Assert
-            await Assert.ThrowsExceptionAsync<OperationCanceledException>(() => task);
+            await Assert.ThrowsExactlyAsync<OperationCanceledException>(() => task);
 
             storageClient.Verify(o =>
                 o.TryAcquireBlobLease(It.IsAny<string>(), It.IsAny<CancellationToken>()),
                 Times.Never);
 
             storageClient.Verify(o =>
-                o.GetTableReference(It.IsAny<string>()),
+                o.GetTableClient(It.IsAny<string>()),
                 Times.Never);
         }
 
@@ -135,7 +131,7 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
 
             var leaseReleased = false;
             blob.OnReleaseCallback = () => leaseReleased = true;
-            table.QueryFunc = () => new[] { new Record() };
+            table.QueryFunc = () => [new Record()];
 
             // Act
             var record = await repository.BeginSynchronousOperation(
@@ -147,6 +143,7 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
             // Assert
             Assert.IsNull(record);
             Assert.IsTrue(leaseReleased);
+            Mock.Verify(storageClient);
         }
 
         [TestMethod]
@@ -156,23 +153,18 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
             var recordId = new RecordId(Scope);
             var recordUpdated = false;
 
-            table.QueryFunc = () => new[]
-            {
-                new Record { ETag = Guid.NewGuid().ToString() }
-            };
+            table.QueryFunc = () =>
+            [
+                new Record(recordId) { ETag = new Azure.ETag(Guid.NewGuid().ToString()) }
+            ];
 
             table.CommandFunc = (operation, _) =>
             {
                 recordUpdated =
-                    operation.Entity.RowKey == recordId.RowKey &&
-                    operation.Entity.PartitionKey == recordId.PartitionKey;
+                    operation.RowKey == recordId.RowKey &&
+                    operation.PartitionKey == recordId.PartitionKey;
 
-                return new()
-                {
-                    Result = operation.Entity,
-                    Etag = operation.Entity.ETag,
-                    HttpStatusCode = 204
-                };
+                return null;
             };
 
             // Act
@@ -189,15 +181,10 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
             var recordId = new RecordId(Scope);
             var requestIsSent = false;
 
-            table.CommandFunc = (operation, _) =>
+            table.CommandFunc = (record, _) =>
             {
                 requestIsSent = true;
-                return new()
-                {
-                    Result = operation.Entity,
-                    Etag = operation.Entity.ETag,
-                    HttpStatusCode = 204
-                };
+                return MockResponse.NoContent;
             };
 
             // Act
@@ -214,29 +201,20 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
             var recordId = new RecordId(Scope);
             var recordUpdated = false;
 
-            table.QueryFunc = () => new[]
-            {
-                new Record { ETag = Guid.NewGuid().ToString() }
-            };
-
+            table.QueryFunc = () => [new Record(recordId)];
             table.CommandFunc = (operation, _) =>
             {
                 table.CommandFunc = (nextOp, _) =>
                 {
                     recordUpdated =
-                        nextOp.Entity.RowKey == recordId.RowKey &&
-                        nextOp.Entity.PartitionKey == recordId.PartitionKey;
+                        nextOp.RowKey == recordId.RowKey &&
+                        nextOp.PartitionKey == recordId.PartitionKey;
 
-                    return new()
-                    {
-                        Result = nextOp.Entity,
-                        Etag = nextOp.Entity.ETag,
-                        HttpStatusCode = 204
-                    };
+                    return MockResponse.NoContent;
                 };
 
-                var result = new RequestResult { HttpStatusCode = 412 };
-                throw new StorageException(result, null, null);
+                var errorResponse = MockResponse.PreconditionFailed;
+                throw new RequestFailedException(errorResponse);
             };
 
             // Act
@@ -257,28 +235,20 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
             var originalExpiration = DateTime.UtcNow;
             var expectedExpiration = originalExpiration + extendBy;
 
-            var record = new Record
+            var record = new Record(recordId)
             {
-                ETag = Guid.NewGuid().ToString(),
                 ExpiresAt = originalExpiration
             };
 
-            table.QueryFunc = () => new[] { record };
+            table.QueryFunc = () => [record];
             table.CommandFunc = (operation, _) =>
             {
                 leaseExtended =
-                    operation.Entity.RowKey == recordId.RowKey &&
-                    operation.Entity.PartitionKey == recordId.PartitionKey;
+                    operation.RowKey == recordId.RowKey &&
+                    operation.PartitionKey == recordId.PartitionKey;
 
-                var dynamicEntity = (operation.Entity as DynamicTableEntity).Properties;
-                record.ExpiresAt = dynamicEntity[nameof(Record.ExpiresAt)].DateTime.Value;
-
-                return new()
-                {
-                    Result = operation.Entity,
-                    Etag = operation.Entity.ETag,
-                    HttpStatusCode = 204
-                };
+                record.ExpiresAt = operation.ExpiresAt;
+                return MockResponse.NoContent;
             };
 
             // Act
@@ -303,34 +273,30 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
             var originalExpiration = DateTime.UtcNow;
             var expectedExpiration = originalExpiration + extendBy;
 
-            var record = new Record
+            var record = new Record(recordId)
             {
-                ETag = Guid.NewGuid().ToString(),
                 ExpiresAt = originalExpiration
             };
 
-            table.QueryFunc = () => new[] { record };
+            table.QueryFunc = () => [new Record(recordId)
+            {
+                ExpiresAt = originalExpiration
+            }];
+
             table.CommandFunc = (operation, _) =>
             {
                 table.CommandFunc = (nextOp, _) =>
                 {
                     leaseExtended =
-                        nextOp.Entity.RowKey == recordId.RowKey &&
-                        nextOp.Entity.PartitionKey == recordId.PartitionKey;
+                        nextOp.RowKey == recordId.RowKey &&
+                        nextOp.PartitionKey == recordId.PartitionKey;
 
-                    var dynamicEntity = (nextOp.Entity as DynamicTableEntity).Properties;
-                    record.ExpiresAt = dynamicEntity[nameof(Record.ExpiresAt)].DateTime.Value;
-
-                    return new()
-                    {
-                        Result = nextOp.Entity,
-                        Etag = nextOp.Entity.ETag,
-                        HttpStatusCode = 204
-                    };
+                    record.ExpiresAt = nextOp.ExpiresAt;
+                    return MockResponse.NoContent;
                 };
 
-                var result = new RequestResult { HttpStatusCode = 412 };
-                throw new StorageException(result, null, null);
+                var errorResponse = MockResponse.PreconditionFailed;
+                throw new RequestFailedException(errorResponse);
             };
 
             // Act
@@ -354,12 +320,7 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
             table.CommandFunc = (operation, _) =>
             {
                 requestIsSent = true;
-                return new TableResult
-                {
-                    Result = operation.Entity,
-                    Etag = operation.Entity.ETag,
-                    HttpStatusCode = 204
-                };
+                return MockResponse.NoContent;
             };
 
             // Act
@@ -377,7 +338,7 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
         public async Task VerifyResourceIsAvailableWhenActiveRecordDoesNotExist()
         {
             // Arrange
-            table.QueryFunc = () => Enumerable.Empty<Record>();
+            table.QueryFunc = () => [];
 
             // Act
             var available = await repository.IsResourceAvailable(
@@ -392,7 +353,7 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
         public async Task VerifyResourceIsUnavailableWhenActiveRecordExists()
         {
             // Arrange
-            table.QueryFunc = () => new[] { new Record() };
+            table.QueryFunc = () => [new Record()];
 
             // Act
             var available = await repository.IsResourceAvailable(
@@ -409,19 +370,14 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
             // Arrange
             storageClient
                 .Setup(o => o.TryAcquireBlobLease(It.IsAny<string>(), default))
-                .ReturnsAsync(new BlobLease(blob, 3, "leaseid"));
+                .ReturnsAsync(new BlobLease(blob, 3, "leaseid"))
+                .Verifiable();
 
             table.CommandFunc = (operation, token) =>
             {
                 Thread.Sleep(TimeSpan.FromSeconds(5));
                 token.ThrowIfCancellationRequested();
-
-                return new TableResult
-                {
-                    Result = operation.Entity,
-                    Etag = operation.Entity.ETag,
-                    HttpStatusCode = 204
-                };
+                return MockResponse.NoContent;
             };
 
             // Act
@@ -432,7 +388,8 @@ namespace SynchronizationUtils.GlobalLock.Tests.Persistence
                 default);
 
             // Assert
-            await Assert.ThrowsExceptionAsync<OperationCanceledException>(() => task);
+            await Assert.ThrowsExactlyAsync<OperationCanceledException>(() => task);
+            Mock.Verify(storageClient);
         }
     }
 }

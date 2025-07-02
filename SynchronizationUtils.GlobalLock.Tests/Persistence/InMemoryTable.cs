@@ -1,46 +1,33 @@
-﻿using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Table;
-using System.Reflection;
+﻿using Azure;
+using Azure.Data.Tables;
+using Azure.Data.Tables.Models;
 
 namespace SynchronizationUtils.GlobalLock.Tests.Persistence
 {
-    internal class InMemoryTable : CloudTable
+    internal partial class InMemoryTable : TableClient
     {
+        public Func<Record, CancellationToken, Response> CommandFunc { get; set; }
+
         public Func<IEnumerable<Record>> QueryFunc { get; set; }
 
-        public Func<TableOperation, CancellationToken, TableResult> CommandFunc { get; set; }
-
-        public InMemoryTable() : base(new Uri("https://account.table.core.windows.net/locks")) { }
-
-        public override Task<TableResult> ExecuteAsync(TableOperation operation, TableRequestOptions requestOptions, OperationContext operationContext, CancellationToken cancellationToken)
+        public override AsyncPageable<T> QueryAsync<T>(string filter = null, int? maxPerPage = null, IEnumerable<string> select = null, CancellationToken cancellationToken = default)
         {
-            return Task.FromResult(CommandFunc?.Invoke(operation, cancellationToken));
+            return AsyncPageable<T>.FromPages([Page<T>.FromValues([.. QueryFunc().Cast<T>()], null, null)]);
         }
 
-        public override Task<TableQuerySegment<T>> ExecuteQuerySegmentedAsync<T>(TableQuery<T> query, TableContinuationToken token, TableRequestOptions requestOptions, OperationContext operationContext, CancellationToken cancellationToken)
+        public override Task<Response> AddEntityAsync<T>(T entity, CancellationToken cancellationToken = default)
         {
-            return Task.FromResult(GetQueryResult(QueryFunc?.Invoke())) as Task<TableQuerySegment<T>>;
+            return Task.FromResult(CommandFunc(entity as Record, cancellationToken));
         }
 
-        public override Task<bool> CreateIfNotExistsAsync(TableRequestOptions requestOptions, OperationContext operationContext, CancellationToken cancellationToken)
+        public override Task<Response> UpdateEntityAsync<T>(T entity, ETag ifMatch, TableUpdateMode mode = TableUpdateMode.Merge, CancellationToken cancellationToken = default)
         {
-            return Task.FromResult(true);
+            return Task.FromResult(CommandFunc(entity as Record, cancellationToken));
         }
 
-        private static TableQuerySegment<Record> GetQueryResult(IEnumerable<Record> records)
+        public override Task<Response<TableItem>> CreateIfNotExistsAsync(CancellationToken cancellationToken = default)
         {
-            var constructor = GetConstructor(typeof(TableQuerySegment<Record>));
-
-            var tableQuerySegment = constructor.Invoke(new object[]
-            {
-                records?.ToList() ?? new List<Record>()
-            });
-
-            return tableQuerySegment as TableQuerySegment<Record>;
+            return Task.FromResult(Response.FromValue(new TableItem(string.Empty), new MockResponse(201, "Created")));
         }
-
-        private static ConstructorInfo GetConstructor(Type type) => type
-            .GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic)
-            .FirstOrDefault(o => o.GetParameters().Length == 1);
     }
 }

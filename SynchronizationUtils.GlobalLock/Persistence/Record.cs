@@ -1,14 +1,35 @@
-﻿using SynchronizationUtils.GlobalLock.Utils;
-using Microsoft.WindowsAzure.Storage.Table;
+﻿using Azure.Data.Tables;
+using SynchronizationUtils.GlobalLock.Utils;
 using System;
+using System.Runtime.Serialization;
 
 namespace SynchronizationUtils.GlobalLock.Persistence
 {
     /// <summary>
     /// Represents an entry in the synchronous operations history log.
     /// </summary>
-    internal class Record : TableEntity
+    internal class Record : ITableEntity
     {
+        /// <summary>
+        /// Gets or sets the partition key of the table entity.
+        /// </summary>
+        public string PartitionKey { get; set; }
+
+        /// <summary>
+        /// Gets or sets the row key of the table entity.
+        /// </summary>
+        public string RowKey { get; set; }
+
+        /// <summary>
+        /// Gets or sets the timestamp of the table entity.
+        /// </summary>
+        public DateTimeOffset? Timestamp { get; set; }
+
+        /// <summary>
+        /// Gets or sets the ETag of the table entity.
+        /// </summary>
+        public Azure.ETag ETag { get; set; }
+
         /// <summary>
         /// Initializes a new instance of the <see cref="Record"/> class.
         /// </summary>
@@ -18,15 +39,17 @@ namespace SynchronizationUtils.GlobalLock.Persistence
         /// Initializes a new instance of the <see cref="Record"/> class.
         /// </summary>
         /// <param name="id">The record ID.</param>
-        public Record(RecordId id) : base(
-            Ensure.IsNotNullOrWhiteSpace(id?.PartitionKey),
-            Ensure.IsNotNullOrWhiteSpace(id?.RowKey))
-        { }
+        public Record(RecordId id)
+        {
+            PartitionKey = Ensure.IsNotNullOrWhiteSpace(id?.PartitionKey);
+            RowKey = Ensure.IsNotNullOrWhiteSpace(id?.RowKey);
+        }
 
         /// <summary>
         /// Gets the record ID.
+        /// Note: This property is not stored in the table as it's derived from PartitionKey and RowKey.
         /// </summary>
-        [IgnoreProperty]
+        [IgnoreDataMember]
         public RecordId Id => new(RowKey, PartitionKey);
 
         /// <summary>

@@ -2,7 +2,7 @@
 {
     internal class InMemoryRepository : IRepository
     {
-        private readonly List<Record> records = new();
+        private readonly List<Record> records = [];
         private readonly DateTime dateTimeMin = new(1601, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
         public int TotalCount => records.Count;

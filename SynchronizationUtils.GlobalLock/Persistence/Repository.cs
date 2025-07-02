@@ -1,8 +1,8 @@
-﻿using SynchronizationUtils.GlobalLock.Configuration;
-using SynchronizationUtils.GlobalLock.Utils;
+﻿using Azure;
+using Azure.Data.Tables;
 using Microsoft.Extensions.Options;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Table;
+using SynchronizationUtils.GlobalLock.Configuration;
+using SynchronizationUtils.GlobalLock.Utils;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -38,9 +38,7 @@ namespace SynchronizationUtils.GlobalLock.Persistence
             token.ThrowIfCancellationRequested();
 
             var partitionKey = new RecordId(scope).PartitionKey;
-            var predicate = TableQuery.GenerateFilterCondition(nameof(Record.Resource),
-                QueryComparisons.Equal,
-                resource);
+            var predicate = $"{nameof(Record.Resource)} eq '{resource}'";
 
             try
             {
@@ -48,7 +46,7 @@ namespace SynchronizationUtils.GlobalLock.Persistence
                 var record = await GetOngoingOperationRecord(table, predicate, partitionKey, token);
                 return record is null;
             }
-            catch (StorageException e) when (e.InnerException is TaskCanceledException)
+            catch (RequestFailedException e) when (e.InnerException is TaskCanceledException)
             {
                 throw new OperationCanceledException(null, e, token);
             }
@@ -63,9 +61,7 @@ namespace SynchronizationUtils.GlobalLock.Persistence
 
             var rowKey = recordId.RowKey;
             var partitionKey = recordId.PartitionKey;
-            var predicate = TableQuery.GenerateFilterCondition(nameof(Record.RowKey),
-                QueryComparisons.Equal,
-                rowKey);
+            var predicate = $"{nameof(Record.RowKey)} eq '{rowKey}'";
 
             try
             {
@@ -73,22 +69,15 @@ namespace SynchronizationUtils.GlobalLock.Persistence
                 var record = await GetOngoingOperationRecord(table, predicate, partitionKey, token);
                 if (record is null) return false;
 
-                var props = new Dictionary<string, EntityProperty>
-                {
-                    [nameof(Record.ExpiresAt)] = new EntityProperty(record.ExpiresAt + period)
-                };
-
-                var entity = new DynamicTableEntity(partitionKey, rowKey, record.ETag, props);
-                var updateOp = TableOperation.Merge(entity);
-
-                var response = await table.ExecuteAsync(updateOp, null, null, token);
-                return response.HttpStatusCode == 204;
+                record.ExpiresAt += period;
+                var response = await table.UpdateEntityAsync(record, record.ETag, TableUpdateMode.Merge, token);
+                return response.Status == 204;
             }
-            catch (StorageException e) when (e.InnerException is TaskCanceledException)
+            catch (RequestFailedException e) when (e.InnerException is TaskCanceledException)
             {
                 throw new OperationCanceledException(null, e, token);
             }
-            catch (StorageException e) when (e.RequestInformation.HttpStatusCode == 412)
+            catch (RequestFailedException e) when (e.Status == 412)
             {
                 return await ProlongSynchronousOperation(recordId, period, token);
             }
@@ -135,13 +124,11 @@ namespace SynchronizationUtils.GlobalLock.Persistence
                     CompletedAt = dateTimeMin
                 };
 
-                var insertOp = TableOperation.Insert(entity);
                 var table = await GetOrCreateTable(localTokenSource.Token);
-                await table.ExecuteAsync(insertOp, null, null, localTokenSource.Token);
-
+                await table.AddEntityAsync(entity, localTokenSource.Token);
                 return entity;
             }
-            catch (StorageException e) when (e.InnerException is TaskCanceledException)
+            catch (RequestFailedException e) when (e.InnerException is TaskCanceledException)
             {
                 throw new OperationCanceledException(null, e, localTokenSource.Token);
             }
@@ -159,9 +146,7 @@ namespace SynchronizationUtils.GlobalLock.Persistence
 
             var rowKey = recordId.RowKey;
             var partitionKey = recordId.PartitionKey;
-            var predicate = TableQuery.GenerateFilterCondition(nameof(Record.RowKey),
-                QueryComparisons.Equal,
-                rowKey);
+            var predicate = $"{nameof(Record.RowKey)} eq '{rowKey}'";
 
             try
             {
@@ -169,19 +154,14 @@ namespace SynchronizationUtils.GlobalLock.Persistence
                 var record = await GetOngoingOperationRecord(table, predicate, partitionKey, token);
                 if (record is null) return;
 
-                var props = new Dictionary<string, EntityProperty>
-                {
-                    [nameof(Record.CompletedAt)] = new EntityProperty(DateTime.UtcNow)
-                };
-
-                var entity = new DynamicTableEntity(partitionKey, rowKey, record.ETag, props);
-                await table.ExecuteAsync(TableOperation.Merge(entity), null, null, token);
+                record.CompletedAt = DateTime.UtcNow;
+                await table.UpdateEntityAsync(record, record.ETag, TableUpdateMode.Merge, token);
             }
-            catch (StorageException e) when (e.InnerException is TaskCanceledException)
+            catch (RequestFailedException e) when (e.InnerException is TaskCanceledException)
             {
                 throw new OperationCanceledException(null, e, token);
             }
-            catch (StorageException e) when (e.RequestInformation.HttpStatusCode == 412)
+            catch (RequestFailedException e) when (e.Status == 412)
             {
                 await EndSynchronousOperation(recordId, token);
             }
@@ -196,7 +176,7 @@ namespace SynchronizationUtils.GlobalLock.Persistence
         /// <param name="token">A cancellation token.</param>
         /// <returns>An ongoing operation record or null.</returns>
         private async Task<Record> GetOngoingOperationRecord(
-            CloudTable table,
+            TableClient table,
             string predicate,
             string partitionKey,
             CancellationToken token)
@@ -205,56 +185,34 @@ namespace SynchronizationUtils.GlobalLock.Persistence
             Ensure.IsNotNullOrWhiteSpace(predicate, nameof(predicate));
             Ensure.IsNotNullOrWhiteSpace(partitionKey, nameof(partitionKey));
 
-            var partitionKeyEquals = TableQuery.GenerateFilterCondition(
-                nameof(Record.PartitionKey),
-                QueryComparisons.Equal,
-                partitionKey);
+            var partitionKeyEquals = $"{nameof(Record.PartitionKey)} eq '{partitionKey}'";
+            var recordExists = $"({predicate}) and ({partitionKeyEquals})";
+            var notCompleted = $"{nameof(Record.CompletedAt)} eq datetime'{dateTimeMin:yyyy-MM-ddTHH:mm:ss.fffZ}'";
+            var notExpired = $"{nameof(Record.ExpiresAt)} gt datetime'{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ss.fffZ}'";
+            var operationInProgress = $"({notCompleted}) and ({notExpired})";
+            var filter = $"({recordExists}) and ({operationInProgress})";
 
-            var recordExists = TableQuery.CombineFilters(
-                predicate,
-                TableOperators.And,
-                partitionKeyEquals);
+            var results = new List<Record>();
+            var records = table.QueryAsync<Record>(filter, maxPerPage: 2, cancellationToken: token);
 
-            var notCompleted = TableQuery.GenerateFilterConditionForDate(
-                nameof(Record.CompletedAt),
-                QueryComparisons.Equal,
-                dateTimeMin);
+            await foreach (var record in records)
+            {
+                results.Add(record);
+                if (results.Count > 1) break;
+            }
 
-            var notExpired = TableQuery.GenerateFilterConditionForDate(
-                nameof(Record.ExpiresAt),
-                QueryComparisons.GreaterThan,
-                DateTime.UtcNow);
-
-            var operationInProgress = TableQuery.CombineFilters(
-                notCompleted,
-                TableOperators.And,
-                notExpired);
-
-            var filter = TableQuery.CombineFilters(
-                recordExists,
-                TableOperators.And,
-                operationInProgress);
-
-            var query = new TableQuery<Record>()
-                .Where(filter)
-                .Take(2);
-
-            var response = await table.ExecuteQuerySegmentedAsync(
-                query, null, null, null, token
-            );
-
-            return response.Results.SingleOrDefault();
+            return results.SingleOrDefault();
         }
 
         /// <summary>
         /// Gets the table containing the synchronous operations log.
         /// </summary>
         /// <param name="token">A cancellation token.</param>
-        /// <returns>An instance of the <see cref="CloudTable"/> class.</returns>
-        private async Task<CloudTable> GetOrCreateTable(CancellationToken token)
+        /// <returns>An instance of the <see cref="TableClient"/> class.</returns>
+        private async Task<TableClient> GetOrCreateTable(CancellationToken token)
         {
-            var table = await storageClient.GetTableReference(configuration.TableName);
-            await table.CreateIfNotExistsAsync(null, null, token);
+            var table = await storageClient.GetTableClient(configuration.TableName);
+            await table.CreateIfNotExistsAsync(token);
             return table;
         }
     }

@@ -1,12 +1,12 @@
-﻿using SynchronizationUtils.GlobalLock.Configuration;
-using SynchronizationUtils.GlobalLock.Utils;
+﻿using Azure;
+using Azure.Data.Tables;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Azure.Storage.Blobs.Specialized;
 using Microsoft.Extensions.Options;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Blob;
-using Microsoft.WindowsAzure.Storage.Blob.Protocol;
-using Microsoft.WindowsAzure.Storage.Table;
+using SynchronizationUtils.GlobalLock.Configuration;
+using SynchronizationUtils.GlobalLock.Utils;
 using System;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -28,19 +28,19 @@ namespace SynchronizationUtils.GlobalLock.Persistence
         }
 
         /// <inheritdoc/>
-        public Task<CloudBlobContainer> GetContainerReference(string container)
+        public Task<BlobContainerClient> GetContainerClient(string container)
         {
             Ensure.IsNotNullOrWhiteSpace(container, nameof(container));
-            var account = CloudStorageAccount.Parse(configuration.StorageConnectionString);
-            return Task.FromResult(account.CreateCloudBlobClient().GetContainerReference(container));
+            var blobServiceClient = new BlobServiceClient(configuration.StorageConnectionString);
+            return Task.FromResult(blobServiceClient.GetBlobContainerClient(container));
         }
 
         /// <inheritdoc/>
-        public Task<CloudTable> GetTableReference(string table)
+        public Task<TableClient> GetTableClient(string table)
         {
             Ensure.IsNotNullOrWhiteSpace(table, nameof(table));
-            var account = CloudStorageAccount.Parse(configuration.StorageConnectionString);
-            return Task.FromResult(account.CreateCloudTableClient().GetTableReference(table));
+            var tableServiceClient = new TableServiceClient(configuration.StorageConnectionString);
+            return Task.FromResult(tableServiceClient.GetTableClient(table));
         }
 
         /// <inheritdoc/>
@@ -51,10 +51,11 @@ namespace SynchronizationUtils.GlobalLock.Persistence
 
             try
             {
-                var blob = await GetBlobReference(resourceUID, token);
-                return new BlobLease(blob, leaseSeconds - 1, await TryAcquireBlobLease(blob, token));
+                var blobClient = await GetBlobReference(resourceUID, token);
+                var leaseClient = blobClient.GetBlobLeaseClient();
+                return new BlobLease(leaseClient, leaseSeconds - 1, await TryAcquireBlobLease(leaseClient, token));
             }
-            catch (StorageException e) when (e.InnerException is TaskCanceledException)
+            catch (RequestFailedException e) when (e.InnerException is TaskCanceledException)
             {
                 throw new OperationCanceledException(null, e, token);
             }
@@ -65,37 +66,36 @@ namespace SynchronizationUtils.GlobalLock.Persistence
         /// </summary>
         /// <param name="resourceUID">The resource UID to create a lock file for.</param>
         /// <param name="token">A cancellation token.</param>
-        /// <returns>A blob reference.</returns>
-        private async Task<CloudBlockBlob> GetBlobReference(string resourceUID, CancellationToken token)
+        /// <returns>A blob client.</returns>
+        private async Task<BlobClient> GetBlobReference(string resourceUID, CancellationToken token)
         {
-            var container = await GetContainerReference(configuration.ContainerName);
-            await container.CreateIfNotExistsAsync(BlobContainerPublicAccessType.Off,
-                null, null, token);
+            var container = await GetContainerClient(configuration.ContainerName);
+            await container.CreateIfNotExistsAsync(PublicAccessType.None, cancellationToken: token);
 
-            var blob = container.GetBlockBlobReference(resourceUID);
-            var exists = await blob.ExistsAsync(null, null, token);
+            var blob = container.GetBlobClient(resourceUID);
+            var exists = await blob.ExistsAsync(token);
 
-            if (!exists) await blob.UploadTextAsync(string.Empty,
-                Encoding.UTF8,
-                AccessCondition.GenerateEmptyCondition(),
-                null, null, token);
+            if (!exists.Value)
+                await blob.UploadAsync(new BinaryData(string.Empty), false, token);
 
             return blob;
         }
 
         /// <summary>
-        /// Tries to acquire an excusive lock on the given blob associated with some resource UID.
+        /// Tries to acquire an exclusive lock on the given blob associated with some resource UID.
         /// </summary>
-        /// <param name="blob">The blob we are trying to get exclusive access to.</param>
+        /// <param name="leaseClient">The blob lease client we are trying to get exclusive access to.</param>
         /// <param name="token">The cancellation token to be used.</param>
         /// <returns>A newly acquired blob lease ID, otherwise - an empty string.</returns>
-        private async Task<string> TryAcquireBlobLease(CloudBlockBlob blob, CancellationToken token)
+        private async Task<string> TryAcquireBlobLease(BlobLeaseClient leaseClient, CancellationToken token)
         {
             try
             {
-                return await blob.AcquireLeaseAsync(TimeSpan.FromSeconds(leaseSeconds), null, null, null, null, token);
+                var duration = TimeSpan.FromSeconds(leaseSeconds);
+                var response = await leaseClient.AcquireAsync(duration, cancellationToken: token);
+                return response.Value.LeaseId;
             }
-            catch (StorageException e) when (e.RequestInformation.ErrorCode == BlobErrorCodeStrings.LeaseAlreadyPresent)
+            catch (RequestFailedException e) when (e.ErrorCode == BlobErrorCode.LeaseAlreadyPresent)
             {
                 return string.Empty;
             }

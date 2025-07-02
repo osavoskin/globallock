@@ -1,5 +1,5 @@
-using SynchronizationUtils.GlobalLock.Tests.Persistence;
 using Microsoft.Extensions.Options;
+using SynchronizationUtils.GlobalLock.Tests.Persistence;
 
 namespace SynchronizationUtils.GlobalLock.Tests
 {
@@ -37,7 +37,7 @@ namespace SynchronizationUtils.GlobalLock.Tests
         }
 
         [TestMethod]
-        public async Task VerifyLeaseCanBeExtendedWhenBeingHold()
+        public async Task VerifyLeaseCanBeExtendedWhenBeingHeld()
         {
             // Arrange
             var config = Options.Create(new GlobalLockConfiguration());
@@ -87,7 +87,7 @@ namespace SynchronizationUtils.GlobalLock.Tests
             Assert.IsFalse(extended);
         }
 
-        private async Task DoInParallel(IGlobalLock globalLock, InMemoryRepository repository, CancellationToken token)
+        private async Task DoInParallel(GlobalLock globalLock, InMemoryRepository repository, CancellationToken token)
         {
             for (int i = 0; i < 10; i++)
             {
@@ -125,7 +125,7 @@ namespace SynchronizationUtils.GlobalLock.Tests
             }
         }
 
-        private async Task<ILease> GetLease(IGlobalLock globalLock, CancellationToken token)
+        private async Task<ILease> GetLease(GlobalLock globalLock, CancellationToken token)
         {
             var lease = await globalLock.TryAcquire(Resource, Scope, null, token);
             if (lease.IsAcquired) return lease;

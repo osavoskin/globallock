@@ -1,6 +1,6 @@
-﻿using SynchronizationUtils.GlobalLock.Utils;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Blob;
+﻿using Azure;
+using Azure.Storage.Blobs.Specialized;
+using SynchronizationUtils.GlobalLock.Utils;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,7 +12,7 @@ namespace SynchronizationUtils.GlobalLock.Persistence
     /// </summary>
     internal class BlobLease : IAsyncDisposable
     {
-        private readonly CloudBlockBlob blob;
+        private readonly BlobLeaseClient leaseClient;
         private readonly string leaseId;
         private bool isReleased;
 
@@ -29,12 +29,12 @@ namespace SynchronizationUtils.GlobalLock.Persistence
         /// <summary>
         /// Initializes a new instance of the <see cref="BlobLease"/> class.
         /// </summary>
-        /// <param name="blob">A blob reference.</param>
+        /// <param name="leaseClient">A blob lease client.</param>
         /// <param name="timeout">The lease expiration timeout in seconds.</param>
         /// <param name="leaseId">The lease ID.</param>
-        public BlobLease(CloudBlockBlob blob, double timeout, string leaseId)
+        public BlobLease(BlobLeaseClient leaseClient, double timeout, string leaseId)
         {
-            this.blob = Ensure.IsNotNull(blob, nameof(blob));
+            this.leaseClient = Ensure.IsNotNull(leaseClient, nameof(leaseClient));
             this.leaseId = leaseId;
             RunTimer(Ensure.IsGreaterThan(timeout, 0, nameof(timeout)));
         }
@@ -51,10 +51,9 @@ namespace SynchronizationUtils.GlobalLock.Persistence
 
             try
             {
-                var condition = new AccessCondition { LeaseId = leaseId };
-                await blob.ReleaseLeaseAsync(condition, null, null, token);
+                await leaseClient.ReleaseAsync(cancellationToken: token);
             }
-            catch (StorageException e) when (e.InnerException is TaskCanceledException)
+            catch (RequestFailedException e) when (e.InnerException is TaskCanceledException)
             {
                 throw new OperationCanceledException(null, e, token);
             }
